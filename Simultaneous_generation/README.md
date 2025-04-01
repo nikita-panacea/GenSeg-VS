@@ -1,4 +1,4 @@
-# Pytorch code for generating image-mask pairs simultaneously
+# Code for generating image-mask pairs simultaneously
 
 ## Generative model pre-training
 
