@@ -63,7 +63,7 @@ We verify the effectiveness of GenSeg with diffusion-based and VAE-based mask-to
 
 ## Exploration on generating image-mask pairs simultaneously
 
-We explore the effectiveness of synthesizing image-mask pairs simultaneously with WGAN-GP.
+We explore the effectiveness of synthesizing image-mask pairs simultaneously with [WGAN-GP](./Simultaneous_generation).
 
 ## Citation
 If you find this project useful in your research, please consider citing:
