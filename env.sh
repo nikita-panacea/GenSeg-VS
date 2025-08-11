@@ -10,3 +10,6 @@ pip install timm
 pip install wandb
 pip install pip==23.3
 pip install betty-ml==0.2.0
+pip install nibabel
+pip install torchsummary
+pip install torchio

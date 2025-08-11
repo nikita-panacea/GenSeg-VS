@@ -93,5 +93,6 @@ class TrainOptions(BaseOptions):
                             help='Perform evaluation only')
         parser.add_argument('--throughput', action='store_true',
                     help='Test throughput only')
+        parser.add_argument('--few_shot_per_class', type=int, default=-1, help='If >0, number of training slices to sample for each class')
         self.isTrain = True
         return parser

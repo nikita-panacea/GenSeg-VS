@@ -47,6 +47,8 @@ class Pix2PixModel(BaseModel):
             opt (Option class)-- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         BaseModel.__init__(self, opt)
+        # Print mini-batch shapes once for debugging/inspection
+        self._shape_debug_printed = False
         self.mask = None
         self.truth = None
         self.real_A = None
@@ -133,10 +135,26 @@ class Pix2PixModel(BaseModel):
             self.truth = torch.zeros(self.real_B.shape, dtype=torch.bool)
         self.truth = self.truth.to(self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
+        # One-time debug print of incoming mini-batch shapes
+        if not self._shape_debug_printed:
+            try:
+                print(
+                    f"[pix2pix] real_A: {tuple(self.real_A.shape)}, real_B: {tuple(self.real_B.shape)}, "
+                    f"mask: {tuple(self.mask.shape)}, truth: {tuple(self.truth.shape) if self.truth is not None else None}"
+                )
+            except Exception:
+                pass
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG(self.real_A)  # G(A) A: [1, 1, 64, 64, 64] G(A): [1, 1, 64, 64, 64]
+        # One-time debug print of generated mini-batch shape
+        if not self._shape_debug_printed:
+            try:
+                print(f"[pix2pix] fake_B: {tuple(self.fake_B.shape)}")
+            except Exception:
+                pass
+            self._shape_debug_printed = True
 
     def backward_D(self):
         """Calculate GAN loss for the discriminator"""
