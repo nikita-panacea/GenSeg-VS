@@ -4,4 +4,4 @@ model_soups*
 soup_result
 */__pycache__
 *.pth
-
+GenSeg-3D/flipped_outputs.zip
