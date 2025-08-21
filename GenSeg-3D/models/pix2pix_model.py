@@ -176,6 +176,64 @@ class Pix2PixModel(BaseModel):
         else:
             self.loss_D.backward()
 
+    def compute_losses_no_backward(self):
+        """Compute and store loss tensors without performing backward.
+
+        Useful for detecting NaNs before applying optimizer steps.
+        """
+        # Fake; stop backprop to the generator by detaching fake_B
+        fake_AB = torch.cat((self.real_A, self.fake_B), 1)  # conditional GAN
+        pred_fake = self.netD(fake_AB.detach())
+        loss_D_fake = self.criterionGAN(pred_fake, False)
+        # Real
+        real_AB = torch.cat((self.real_A, self.real_B), 1)
+        pred_real = self.netD(real_AB)
+        loss_D_real = self.criterionGAN(pred_real, True)
+        loss_D = (loss_D_fake + loss_D_real) * 0.5
+
+        # Generator parts
+        pred_fake_for_G = self.netD(torch.cat((self.real_A, self.fake_B), 1))
+        loss_G_GAN = self.criterionGAN(pred_fake_for_G, True)
+        loss_G_L1 = self.criterionL1(self.fake_B * self.mask, self.real_B * self.mask) * self.opt.lambda_L1
+        loss_G_L1 = zero_division(loss_G_L1, torch.sum(self.mask))
+        loss_G_L2_T = self.criterionTumor(self.fake_B * self.truth, self.real_B * self.truth) * self.opt.gamma_TMSE
+        loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(self.truth))
+
+        # Radiomics (use existing helpers if available)
+        try:
+            from radiomics.features import masked_tensor_stats, features_to_vector, normalize_feature_vector
+            with torch.no_grad():
+                rmask = self.mask if self.opt.mask_aug == 'none' else None
+            feats_real = masked_tensor_stats(self.real_B, rmask)
+            feats_fake = masked_tensor_stats(self.fake_B, rmask)
+            vec_real = features_to_vector(feats_real)
+            vec_fake = features_to_vector(feats_fake)
+            vec_real = normalize_feature_vector(vec_real).detach()
+            vec_fake = normalize_feature_vector(vec_fake)
+            loss_G_rad = nn.functional.mse_loss(vec_fake, vec_real)
+        except Exception:
+            loss_G_rad = torch.tensor(0.0, device=self.device)
+
+        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T + getattr(self.opt, 'lambda_rad', 0.0) * loss_G_rad
+
+        # Store (but do not backward)
+        self.loss_D_fake = loss_D_fake
+        self.loss_D_real = loss_D_real
+        self.loss_D = loss_D
+        self.loss_G_GAN = loss_G_GAN
+        self.loss_G_L1 = loss_G_L1
+        self.loss_G_L2_T = loss_G_L2_T
+        self.loss_G_rad = loss_G_rad
+        self.loss_G = loss_G
+        return {
+            'D_fake': loss_D_fake.item() if hasattr(loss_D_fake, 'item') else float(loss_D_fake),
+            'D_real': loss_D_real.item() if hasattr(loss_D_real, 'item') else float(loss_D_real),
+            'G_GAN': loss_G_GAN.item() if hasattr(loss_G_GAN, 'item') else float(loss_G_GAN),
+            'G_L1': loss_G_L1.item() if hasattr(loss_G_L1, 'item') else float(loss_G_L1),
+            'G_L2_T': loss_G_L2_T.item() if hasattr(loss_G_L2_T, 'item') else float(loss_G_L2_T),
+            'G_rad': loss_G_rad.item() if hasattr(loss_G_rad, 'item') else float(loss_G_rad),
+        }
+
     def backward_G(self):
         """Calculate GAN and L1 loss for the generator"""
         # First, G(A) should fake the discriminator

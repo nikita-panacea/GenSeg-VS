@@ -99,6 +99,13 @@ class BaseModel(ABC):
                 net = getattr(self, 'net' + name)
                 net.eval()
 
+    def train(self):
+        """Make models train mode during training time"""
+        for name in self.model_names:
+            if isinstance(name, str):
+                net = getattr(self, 'net' + name)
+                net.train()
+
     def test(self):
         """Forward function used in test time.
 
@@ -151,17 +158,46 @@ class BaseModel(ABC):
         Parameters:
             epoch (int) -- current epoch; used in the file name '%s_net_%s.pth' % (epoch, name)
         """
+        # Save each network atomically: write to temp file then rename. If the
+        # new zipfile serialization fails, fall back to legacy serialization.
         for name in self.model_names:
-            if isinstance(name, str):
-                save_filename = '%s_net_%s.pth' % (epoch, name)
-                save_path = os.path.join(self.save_dir, save_filename)
-                net = getattr(self, 'net' + name)
+            if not isinstance(name, str):
+                continue
+            save_filename = '%s_net_%s.pth' % (epoch, name)
+            save_path = os.path.join(self.save_dir, save_filename)
+            net = getattr(self, 'net' + name)
 
-                if len(self.gpu_ids) > 0 and torch.cuda.is_available():
-                    torch.save(net.module.cpu().state_dict(), save_path)
-                    net.cuda(self.gpu_ids[0])
-                else:
-                    torch.save(net.cpu().state_dict(), save_path)
+            # Ensure save directory exists
+            os.makedirs(self.save_dir, exist_ok=True)
+
+            # Get underlying module (handle DataParallel)
+            if isinstance(net, torch.nn.DataParallel):
+                target_mod = net.module
+            else:
+                target_mod = net
+
+            # Extract CPU state dict without moving model device
+            state_dict = target_mod.state_dict()
+            state_cpu = {k: v.cpu() for k, v in state_dict.items()}
+
+            tmp_path = save_path + '.tmp'
+            try:
+                # Try default (new zipfile) serialization first
+                torch.save(state_cpu, tmp_path)
+                os.replace(tmp_path, save_path)
+            except Exception:
+                try:
+                    # Fallback: legacy serialization
+                    torch.save(state_cpu, tmp_path, _use_new_zipfile_serialization=False)
+                    os.replace(tmp_path, save_path)
+                except Exception as e:
+                    # Cleanup and warn
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    print('Warning: failed to save model %s to %s: %s' % (name, save_path, str(e)))
 
     def __patch_instance_norm_state_dict(self, state_dict, module, keys, i=0):
         """Fix InstanceNorm checkpoints incompatibility (prior to 0.4)"""

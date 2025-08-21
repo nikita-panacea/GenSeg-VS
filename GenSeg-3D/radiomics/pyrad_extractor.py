@@ -1,16 +1,10 @@
 from typing import Dict, List, Tuple, Optional
-
 import torch
-
-
-def _lazy_imports():
-    import SimpleITK as sitk  # type: ignore
-    from radiomics import featureextractor  # type: ignore
-    return sitk, featureextractor
-
+import SimpleITK as sitk  # type: ignore
+import radiomics
+from radiomics import featureextractor  # type: ignore
 
 def resample_seg_to_image(segmentation, reference_image):
-    sitk, _ = _lazy_imports()
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(reference_image)
     resampler.SetInterpolator(sitk.sitkNearestNeighbor)
@@ -26,7 +20,6 @@ def extract_all_features(image_path: str, mask_path: str, settings: Optional[Dic
     Extract the full set of PyRadiomics features, mirroring the notebook approach.
     Returns a dict: feature_name -> value (float).
     """
-    sitk, featureextractor = _lazy_imports()
     img = sitk.ReadImage(image_path)
     seg = sitk.ReadImage(mask_path)
     seg = resample_seg_to_image(seg, img)
@@ -41,11 +34,11 @@ def extract_all_features(image_path: str, mask_path: str, settings: Optional[Dic
 
     feats = extractor.execute(img, seg)
     # Keep only numerical features
-    out = {}
-    for k, v in feats.items():
-        if isinstance(v, (int, float)):
-            out[str(k)] = float(v)
-    return out
+    # out = {}
+    # for k, v in feats.items():
+    #     if isinstance(v, (int, float)):
+    #         out[str(k)] = float(v)
+    return feats # out
 
 
 def align_feature_vectors(dicts: List[Dict[str, float]], names: Optional[List[str]] = None) -> Tuple[torch.Tensor, List[str]]:
