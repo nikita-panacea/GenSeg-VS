@@ -1,5 +1,5 @@
-CUDA_VISIBLE_DEVICES=1 python GenSeg-3D/train_vs_radiomics.py \
-    --csv /data/li/Pix2PixNIfTI/data_liver/vs_dataset.csv \ 
+CUDA_VISIBLE_DEVICES=0 python3 train_vs.py \
+    --csv D:\GenSeg-VS\GenSeg_VS.csv \ 
     --name vs_exp \ 
     --checkpoints_dir ./pix2pix_vs_checkpoints \ 
     --gpu_ids 0 \ 

@@ -245,3 +245,43 @@ def mkdir(path):
     """
     if not os.path.exists(path):
         os.makedirs(path)
+
+
+def radiomics_features(img_tensor, seg_tensor):
+    import SimpleITK as sitk
+    from radiomics import featureextractor
+
+    img_tensor= img_tensor.squeeze().squeeze()
+    seg_tensor= seg_tensor.squeeze().squeeze()
+
+    sitk_image = sitk.GetImageFromArray(img_tensor.numpy())  
+    sitk_mask  = sitk.GetImageFromArray(seg_tensor.numpy())
+
+    extractor = featureextractor.RadiomicsFeatureExtractor()
+    selected_feature_names = ['original_shape_Maximum2DDiameterRow','original_shape_SurfaceArea','original_glszm_LargeAreaHighGrayLevelEmphasis','original_shape_SurfaceVolumeRatio','original_shape_MajorAxisLength','original_shape_Maximum3DDiameter']
+
+    # Directly pass the SimpleITK images
+    features = extractor.execute(sitk_image, sitk_mask, label=1)
+
+    extracted_features = {
+        key: float(np.log1p(features[key])) if hasattr(features[key], "item") else np.log1p(features[key])
+        for key in selected_feature_names
+        if key in features
+    }
+
+    return extracted_features
+
+
+def rad_mse(d1, d2):
+    keys = sorted(d1.keys() & d2.keys())
+    if not keys:
+        raise ValueError("No overlapping keys.")
+    diffsq = []
+    for k in keys:
+        try:
+            v1 = float(d1[k])
+            v2 = float(d2[k])
+        except (TypeError, ValueError):
+            raise TypeError(f"Non-numeric value at key '{k}': {d1[k]} vs {d2[k]}")
+        diffsq.append((v1 - v2) ** 2)
+    return sum(diffsq) / len(diffsq)

@@ -32,6 +32,7 @@ class Pix2Pix3DModel(Pix2PixModel):
         parser.set_defaults(norm='batch', netG='unet_128', dataset_mode='aligned')
         parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
         parser.add_argument('--gamma_TMSE', type=float, default=0.0, help='weight for L2 truth loss in tumor area')
+        parser.add_argument('--rad_wt', type=float, default=1.0, help='weight for radiomics features')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 
