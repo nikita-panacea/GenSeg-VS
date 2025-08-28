@@ -3,6 +3,7 @@ from .base_model import BaseModel
 from . import networks
 from util.util import zero_division
 from .networks import arch_parameters
+from util.util import radiomics_features
 
 
 class Pix2PixModel(BaseModel):
@@ -35,6 +36,8 @@ class Pix2PixModel(BaseModel):
         parser.set_defaults(norm='batch', netG='unet_256', dataset_mode='aligned')
         parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
         parser.add_argument('--gamma_TMSE', type=float, default=100.0, help='weight for L2 truth loss in tumor area')
+        # radiomics loss weight
+        parser.add_argument('--gamma_rad', type=float, default=100.0, help='weight for radiomics loss')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 
@@ -47,8 +50,6 @@ class Pix2PixModel(BaseModel):
             opt (Option class)-- stores all the experiment flags; needs to be a subclass of BaseOptions
         """
         BaseModel.__init__(self, opt)
-        # Print mini-batch shapes once for debugging/inspection
-        self._shape_debug_printed = False
         self.mask = None
         self.truth = None
         self.real_A = None
@@ -56,7 +57,7 @@ class Pix2PixModel(BaseModel):
         self.fp16 = opt.fp16
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'G_L1', 'G_L2_T', 'D_real', 'D_fake']
+        self.loss_names = ['G_GAN', 'G_L1', 'G_L2_T', 'G_rad', 'D_real', 'D_fake']
         # specify the images you want to save/display.
         # The training/test scripts will call <BaseModel.get_current_visuals>
         self.visual_names = ['real_A', 'fake_B', 'real_B', 'truth']
@@ -89,6 +90,8 @@ class Pix2PixModel(BaseModel):
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
             self.criterionL1 = torch.nn.L1Loss(reduction=red_param)
             self.criterionTumor = torch.nn.MSELoss(reduction=red_param)
+            # Radiomics should be compared per-feature, so use mean reduction
+            self.criterionRadiomics = torch.nn.MSELoss(reduction='mean')
             self.arch_param = arch_parameters()
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -135,26 +138,24 @@ class Pix2PixModel(BaseModel):
             self.truth = torch.zeros(self.real_B.shape, dtype=torch.bool)
         self.truth = self.truth.to(self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
-        # One-time debug print of incoming mini-batch shapes
-        if not self._shape_debug_printed:
-            try:
-                print(
-                    f"[pix2pix] real_A: {tuple(self.real_A.shape)}, real_B: {tuple(self.real_B.shape)}, "
-                    f"mask: {tuple(self.mask.shape)}, truth: {tuple(self.truth.shape) if self.truth is not None else None}"
-                )
-            except Exception:
-                pass
+        # Extract radiomics features for the (image, mask) pair before generator
+        try:
+            # radiomics_features expects CPU tensors (it converts to numpy internally)
+            # Use the generator input (real_A) after augmentations but before sending to G
+            self.rad_real = radiomics_features(self.real_A.cpu(), self.mask.cpu()).to(self.device)
+        except Exception:
+            # If radiomics extraction fails, disable radiomics loss for this batch
+            self.rad_real = None
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         self.fake_B = self.netG(self.real_A)  # G(A) A: [1, 1, 64, 64, 64] G(A): [1, 1, 64, 64, 64]
-        # One-time debug print of generated mini-batch shape
-        if not self._shape_debug_printed:
-            try:
-                print(f"[pix2pix] fake_B: {tuple(self.fake_B.shape)}")
-            except Exception:
-                pass
-            self._shape_debug_printed = True
+        # Extract radiomics features for the generated image paired with the (possibly augmented) mask
+        try:
+            # use detached CPU tensor for radiomics extraction
+            self.rad_fake = radiomics_features(self.fake_B.detach().cpu(), self.mask.cpu()).to(self.device)
+        except Exception:
+            self.rad_fake = None
 
     def backward_D(self):
         """Calculate GAN loss for the discriminator"""
@@ -176,64 +177,6 @@ class Pix2PixModel(BaseModel):
         else:
             self.loss_D.backward()
 
-    def compute_losses_no_backward(self):
-        """Compute and store loss tensors without performing backward.
-
-        Useful for detecting NaNs before applying optimizer steps.
-        """
-        # Fake; stop backprop to the generator by detaching fake_B
-        fake_AB = torch.cat((self.real_A, self.fake_B), 1)  # conditional GAN
-        pred_fake = self.netD(fake_AB.detach())
-        loss_D_fake = self.criterionGAN(pred_fake, False)
-        # Real
-        real_AB = torch.cat((self.real_A, self.real_B), 1)
-        pred_real = self.netD(real_AB)
-        loss_D_real = self.criterionGAN(pred_real, True)
-        loss_D = (loss_D_fake + loss_D_real) * 0.5
-
-        # Generator parts
-        pred_fake_for_G = self.netD(torch.cat((self.real_A, self.fake_B), 1))
-        loss_G_GAN = self.criterionGAN(pred_fake_for_G, True)
-        loss_G_L1 = self.criterionL1(self.fake_B * self.mask, self.real_B * self.mask) * self.opt.lambda_L1
-        loss_G_L1 = zero_division(loss_G_L1, torch.sum(self.mask))
-        loss_G_L2_T = self.criterionTumor(self.fake_B * self.truth, self.real_B * self.truth) * self.opt.gamma_TMSE
-        loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(self.truth))
-
-        # Radiomics (use existing helpers if available)
-        try:
-            from radiomics.features import masked_tensor_stats, features_to_vector, normalize_feature_vector
-            with torch.no_grad():
-                rmask = self.mask if self.opt.mask_aug == 'none' else None
-            feats_real = masked_tensor_stats(self.real_B, rmask)
-            feats_fake = masked_tensor_stats(self.fake_B, rmask)
-            vec_real = features_to_vector(feats_real)
-            vec_fake = features_to_vector(feats_fake)
-            vec_real = normalize_feature_vector(vec_real).detach()
-            vec_fake = normalize_feature_vector(vec_fake)
-            loss_G_rad = nn.functional.mse_loss(vec_fake, vec_real)
-        except Exception:
-            loss_G_rad = torch.tensor(0.0, device=self.device)
-
-        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T + getattr(self.opt, 'lambda_rad', 0.0) * loss_G_rad
-
-        # Store (but do not backward)
-        self.loss_D_fake = loss_D_fake
-        self.loss_D_real = loss_D_real
-        self.loss_D = loss_D
-        self.loss_G_GAN = loss_G_GAN
-        self.loss_G_L1 = loss_G_L1
-        self.loss_G_L2_T = loss_G_L2_T
-        self.loss_G_rad = loss_G_rad
-        self.loss_G = loss_G
-        return {
-            'D_fake': loss_D_fake.item() if hasattr(loss_D_fake, 'item') else float(loss_D_fake),
-            'D_real': loss_D_real.item() if hasattr(loss_D_real, 'item') else float(loss_D_real),
-            'G_GAN': loss_G_GAN.item() if hasattr(loss_G_GAN, 'item') else float(loss_G_GAN),
-            'G_L1': loss_G_L1.item() if hasattr(loss_G_L1, 'item') else float(loss_G_L1),
-            'G_L2_T': loss_G_L2_T.item() if hasattr(loss_G_L2_T, 'item') else float(loss_G_L2_T),
-            'G_rad': loss_G_rad.item() if hasattr(loss_G_rad, 'item') else float(loss_G_rad),
-        }
-
     def backward_G(self):
         """Calculate GAN and L1 loss for the generator"""
         # First, G(A) should fake the discriminator
@@ -251,8 +194,14 @@ class Pix2PixModel(BaseModel):
         # TODO: Problem what to do with slices without tumor
         self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.truth))
         # print(self.loss_G_L1, self.loss_G_L2_T)
+        # Radiomics loss: compare radiomics feature tensors of real and fake images
+        if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
+            self.loss_G_rad = self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
+        else:
+            self.loss_G_rad = torch.tensor(0.0, device=self.device)
+
         # combine loss and calculate gradients
-        self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T
+        self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T + self.loss_G_rad
         if self.fp16:
             from apex import amp
             with amp.scale_loss(self.loss_G, self.optimizer_G, loss_id=1) as scaled_loss:

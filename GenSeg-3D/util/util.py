@@ -245,3 +245,75 @@ def mkdir(path):
     """
     if not os.path.exists(path):
         os.makedirs(path)
+
+
+def radiomics_features(img_tensor, seg_tensor):
+    import SimpleITK as sitk
+    from radiomics import featureextractor
+
+    # Radiomics extractor (created once per call)
+    extractor = featureextractor.RadiomicsFeatureExtractor()
+    selected_feature_names = ['original_shape_Maximum2DDiameterRow',
+                              'original_shape_SurfaceArea',
+                              'original_glszm_LargeAreaHighGrayLevelEmphasis',
+                              'original_shape_SurfaceVolumeRatio',
+                              'original_shape_MajorAxisLength',
+                              'original_shape_Maximum3DDiameter']
+
+    def _extract_one(img_t, seg_t):
+        # img_t and seg_t are single-sample CPU tensors (may include channel dim)
+        img_arr = img_t.squeeze().numpy()
+        seg_arr = seg_t.squeeze().numpy()
+        sitk_image = sitk.GetImageFromArray(img_arr)
+        sitk_mask = sitk.GetImageFromArray(seg_arr)
+        features = extractor.execute(sitk_image, sitk_mask, label=1)
+
+        feature_vector = []
+        for key in selected_feature_names:
+            if key in features:
+                try:
+                    val = float(features[key])
+                except Exception:
+                    try:
+                        val = float(np.array(features[key]).item())
+                    except Exception:
+                        val = 0.0
+                feature_vector.append(float(np.log1p(val)))
+            else:
+                feature_vector.append(0.0)
+
+        return torch.tensor(feature_vector, dtype=torch.float32)
+
+    # Ensure tensors are on CPU and detached
+    img_cpu = img_tensor.detach().cpu()
+    seg_cpu = seg_tensor.detach().cpu()
+
+    # If both tensors have a matching leading batch dimension > 1, treat as batch
+    if img_cpu.dim() > 0 and seg_cpu.dim() > 0 and img_cpu.shape[0] == seg_cpu.shape[0] and img_cpu.shape[0] > 1:
+        batch_size = img_cpu.shape[0]
+        feats = []
+        for i in range(batch_size):
+            feats.append(_extract_one(img_cpu[i], seg_cpu[i]))
+        return torch.stack(feats, dim=0)
+
+    # If top-dim is 1 (batch of size 1), handle as single sample
+    if img_cpu.dim() > 0 and seg_cpu.dim() > 0 and img_cpu.shape[0] == 1 and seg_cpu.shape[0] == 1:
+        return _extract_one(img_cpu[0], seg_cpu[0]).unsqueeze(0)
+
+    # Otherwise, treat as single-sample tensors with no explicit batch dim
+    return _extract_one(img_cpu, seg_cpu).unsqueeze(0)
+
+
+def rad_mse(d1, d2):
+    keys = sorted(d1.keys() & d2.keys())
+    if not keys:
+        raise ValueError("No overlapping keys.")
+    diffsq = []
+    for k in keys:
+        try:
+            v1 = float(d1[k])
+            v2 = float(d2[k])
+        except (TypeError, ValueError):
+            raise TypeError(f"Non-numeric value at key '{k}': {d1[k]} vs {d2[k]}")
+        diffsq.append((v1 - v2) ** 2)
+    return sum(diffsq) / len(diffsq)
