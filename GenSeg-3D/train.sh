@@ -1,5 +1,9 @@
-CUDA_VISIBLE_DEVICES=1 python train.py \
-    --dataroot /data/li/Pix2PixNIfTI/data_liver \
-    --dataset_mode nifti \
+CUDA_VISIBLE_DEVICES=0 python train.py \
+    --dataroot /path/to/dataset/root \
+    --dataset_mode vscsv \
+    --csv_file /path/to/your/vs_dataset.csv \
     --model pix2pix3d \
-    --name liver-98 \
+    --name vs_pix2pix3d_experiment \
+    --batch_size 1 \
+    --gpu_ids 0 \
+    --phase train \
