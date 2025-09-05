@@ -36,10 +36,10 @@ class Pix2PixModel(BaseModel):
         """
         # changing the default values to match the pix2pix paper (https://phillipi.github.io/pix2pix/)
         parser.set_defaults(norm='batch', netG='unet_256', dataset_mode='aligned')
-        parser.add_argument('--lambda_L1', type=float, default=1.0, help='weight for L1 loss')
-        parser.add_argument('--gamma_TMSE', type=float, default=1.0, help='weight for L2 truth loss in tumor area')
+        parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
+        parser.add_argument('--gamma_TMSE', type=float, default=100.0, help='weight for L2 truth loss in tumor area')
         # radiomics loss weight
-        parser.add_argument('--gamma_rad', type=float, default=1.0, help='weight for radiomics loss')
+        parser.add_argument('--gamma_rad', type=float, default=100.0, help='weight for radiomics loss')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 
@@ -183,7 +183,7 @@ class Pix2PixModel(BaseModel):
         # Extract radiomics features for the generated image paired with the (possibly augmented) mask
         try:
             # use detached CPU tensor for radiomics extraction
-            radf = radiomics_features(self.fake_B.detach().cpu(), self.mask.cpu())
+            radf = radiomics_features(self.fake_B.cpu(), self.mask.cpu())
             self.rad_fake = radf #.to(self.device)
             # try:
             #     print(f"[rad] rad_fake extracted dtype={self.rad_fake.dtype}, sample={self.rad_fake}")
@@ -223,44 +223,33 @@ class Pix2PixModel(BaseModel):
         # Compute the L1 loss only on the masked values
         self.loss_G_L1 = self.criterionL1(self.fake_B * self.mask, self.real_B * self.mask) * self.opt.lambda_L1
         # Compute the L2 loss on the tumor area
-        # Compute masked tensors as float to get stable stats
-        try:
-            masked_fake = (self.fake_B * self.truth).float()
-            masked_real = (self.real_B * self.truth).float()
-            # raw sum of squared differences over the truth region
-            raw_diffsq = torch.sum((masked_fake - masked_real) ** 2)
-            truth_sum = torch.sum(self.truth)
-            # Avoid division by zero when computing mean diffsq for logging
-            mean_diffsq = raw_diffsq / (truth_sum.float() if truth_sum.item() > 0 else 1.0)
-            print(f"[debug] gamma_TMSE={getattr(self.opt, 'gamma_TMSE', None)}, truth_sum={int(truth_sum.item())}, raw_diffsq={float(raw_diffsq):.6e}, mean_diffsq={float(mean_diffsq):.6e}")
-            try:
-                print(f"[debug] masked_real stats min={float(masked_real.min()):.6e}, max={float(masked_real.max()):.6e}, mean={float(masked_real.mean()):.6e}")
-                print(f"[debug] masked_fake stats min={float(masked_fake.min()):.6e}, max={float(masked_fake.max()):.6e}, mean={float(masked_fake.mean()):.6e}")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[debug] error computing masked stats: {e}")
-
         self.loss_G_L2_T = self.criterionTumor(self.fake_B * self.real_A,
                                                self.real_B * self.real_A) * self.opt.gamma_TMSE
-        print('loss_G_L2_T: ', self.loss_G_L2_T)
         # print('self.fake_B * self.truth: ', self.fake_B * self.truth)
         # print('self.real_B * self.truth: ', self.real_B * self.truth)
-        # normalize by number of truth voxels (preserves previous behavior)
+        # Debugging: print tumor mask sums and L2 values
+        try:
+            t_sum = torch.sum(self.real_A).item() if isinstance(self.real_A, torch.Tensor) else float(torch.sum(self.real_A))
+            # print(f"[debug] realA_sum={t_sum}, loss_G_L2_T_raw={self.loss_G_L2_T}")
+        except Exception:
+            pass
+        # print(self.loss_G_L1, self.loss_G_L2_T)
         self.loss_G_L1 = zero_division(self.loss_G_L1, torch.sum(self.mask))
         # TODO: Problem what to do with slices without tumor
         self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.real_A))
+        # print(f"[debug] After zero division: loss_G_L2_T={self.loss_G_L2_T}")
         # print(self.loss_G_L1, self.loss_G_L2_T)
         # Radiomics loss: compare radiomics feature tensors of real and fake images
-        if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
-            self.loss_G_rad = rad_mse(self.rad_fake, self.rad_real) #* self.opt.gamma_rad #self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
-            # print('radiomics loss: ', self.loss_G_rad)
-        else:
-            self.loss_G_rad = torch.tensor(0.0, device=self.device)
-            # print('radiomics loss (zero tensor): ', self.loss_G_rad)
+        # if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
+        self.loss_G_rad = rad_mse(self.rad_fake, self.rad_real) * self.opt.gamma_rad #self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
+        print('radiomics loss: ', self.loss_G_rad)
+        # else:
+        #     # self.loss_G_rad = torch.tensor(0.0, device=self.device)
+        #     print('radiomics loss (zero tensor): ', self.loss_G_rad)
 
         # combine loss and calculate gradients
         self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T + self.loss_G_rad
+        print('Combined loss_G', self.loss_G)
         if self.fp16:
             from apex import amp
             with amp.scale_loss(self.loss_G, self.optimizer_G, loss_id=1) as scaled_loss:
