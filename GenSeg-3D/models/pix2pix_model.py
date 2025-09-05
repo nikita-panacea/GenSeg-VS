@@ -1,7 +1,8 @@
 import torch
+import torch.nn as nn
 from .base_model import BaseModel
 from . import networks
-from util.util import zero_division
+from util.util import zero_division, radiomics_features, rad_mse
 from .networks import arch_parameters
 
 
@@ -57,7 +58,7 @@ class Pix2PixModel(BaseModel):
         self.fp16 = opt.fp16
         # specify the training losses you want to print out.
         # The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['G_GAN', 'G_L1', 'G_L2_T', 'D_real', 'D_fake']
+        self.loss_names = ['G_GAN', 'G_L1', 'G_L2_T', 'D_real', 'D_fake', 'rad']
         # specify the images you want to save/display.
         # The training/test scripts will call <BaseModel.get_current_visuals>
         self.visual_names = ['real_A', 'fake_B', 'real_B', 'truth']
@@ -197,7 +198,7 @@ class Pix2PixModel(BaseModel):
         loss_G_GAN = self.criterionGAN(pred_fake_for_G, True)
         loss_G_L1 = self.criterionL1(self.fake_B * self.mask, self.real_B * self.mask) * self.opt.lambda_L1
         loss_G_L1 = zero_division(loss_G_L1, torch.sum(self.mask))
-        loss_G_L2_T = self.criterionTumor(self.fake_B * self.truth, self.real_B * self.truth) * self.opt.gamma_TMSE
+        loss_G_L2_T = self.criterionTumor(self.fake_B * self.real_A, self.real_B * self.real_A) * self.opt.gamma_TMSE
         loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(self.truth))
 
         # Radiomics (use existing helpers if available)
