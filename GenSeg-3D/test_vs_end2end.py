@@ -19,8 +19,13 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split, Subset
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
  
 from util import util
+from util.util import radiomics_features, rad_mse
+from UNet3D.config import (
+    TRAINING_EPOCH, NUM_CLASSES, IN_CHANNELS, BCE_WEIGHTS, BACKGROUND_AS_CLASS, TRAIN_CUDA
+)
 from UNet3D.unet3d import UNet3D
 from options.train_options import TrainOptions
 from data import create_dataset
@@ -47,14 +52,14 @@ def evaluate(net, dataloader, device):
             image, label = batch['B'], batch['label']
             if label.dim() == 1:
                 label = label.unsqueeze(1)
-            label_tensor = torch.tensor([label], dtype=torch.float32)
+            label_tensor = label.to(device=device, dtype=torch.float32)
  
             # move images and labels to correct device and type
             image = image.to(device=device, dtype=torch.float32)
  
-            age_pred = net(image)
+            label_pred = net(image)
             # compute the Dice score
-            loss += criterion(age_pred, label_tensor)
+            loss += criterion(label_pred, label_tensor)
  
     net.train()
     # return JC_index / max(num_val_batches, 1)
@@ -63,29 +68,29 @@ def evaluate(net, dataloader, device):
 opt = TrainOptions().parse()   # get training options
 # config = get_config(opt)
 device = torch.device('cuda:0')
-save_path = './checkpoint_e2e/'+'end2end-liver-98-'+time.strftime("%Y%m%d-%H%M%S")
+save_path = './checkpoint_e2e/'+'end2end-vs-128-'+time.strftime("%Y%m%d-%H%M%S")
 if not os.path.exists(save_path):
     os.mkdir(save_path)
 densenet_save_path = save_path+'/densenet.pkl'  
  
 ##### Initialize logging #####
 # logger = wandb.init(project='end2end-unet-ISIC', name="unet-200", resume='allow', anonymous='must')
-logger = wandb.init(project='end2end-hippo', name="e2e-liver-98",
+logger = wandb.init(project='end2end-vs', name="end2end-vs-128",
                     resume='allow', anonymous='must', mode='disabled')
 logger.config.update(vars(opt))
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
  
-##### create models: pix2pix, unet #####
+##### create models: pix2pix, DenseNet #####
 model = create_model(opt)      # create a model given opt.model and other options
 model.setup(opt)               # regular setup: load and print networks; create schedulers
 # load pre-trained model
-model.netG.module.load_state_dict(torch.load('/data/li/Pix2PixNIfTI/checkpoints/liver-98/latest_net_G.pth', map_location=device))
+model.netG.module.load_state_dict(torch.load('/home/ubuntu/Documents/Nafisha/GenSeg-VS/GenSeg-3D/checkpoints/vs_pix2pix3d_exp/best_net_G.pth', map_location=device))
 model.netG = model.netG.to(device)
-model.netD.module.load_state_dict(torch.load('/data/li/Pix2PixNIfTI/checkpoints/liver-98/latest_net_D.pth', map_location=device))
+model.netD.module.load_state_dict(torch.load('/home/ubuntu/Documents/Nafisha/GenSeg-VS/GenSeg-3D/checkpoints/vs_pix2pix3d_exp/best_net_D.pth', map_location=device))
 model.netD = model.netD.to(device)
-model.arch_param = torch.load('/data/li/Pix2PixNIfTI/checkpoints/liver-98/arch_parameters.pth', map_location=device)
+model.arch_param = torch.load('/home/ubuntu/Documents/Nafisha/GenSeg-VS/GenSeg-3D/checkpoints/vs_pix2pix3d_exp/arch_parameters.pth', map_location=device)
  
-net = model= DenseNet3D()
+net = DenseNet3D()
 net = net.to(device=device)
  
 ##### define optimizer for unet #####
@@ -97,8 +102,8 @@ scheduler_densenet = optim.lr_scheduler.ReduceLROnPlateau(optimizer_densenet, 'm
 data_loader = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
 dataset = data_loader.dataset
 total_size = len(dataset)
-split_1 = 78
-split_2 = 20
+split_1 = 81
+split_2 = 21
 split_3 = total_size - split_1 - split_2
  
 # Perform the split
@@ -113,9 +118,9 @@ logging.info('The number of validate images = %d' % len(val_loader))
 train_iters = 5000            # training iterations
 total_iters = 0.0              # the total number of training iterations
 val_best_score = 0.0           # the best val score of unet
-unet_best_score = 0.0          # the best score of unet
+densenet_best_score = 0.0          # the best score of unet
  
-criterion = nn.BCEWithLogitsLoss()
+criterion = BCEWithLogitsLoss().cuda() if torch.cuda.is_available() and TRAIN_CUDA else BCEWithLogitsLoss() # Check if Cross Entropy Loss or BCEWithLogitsLoss is better
  
 class Generator(ImplicitProblem):
     def training_step(self, batch):
@@ -127,16 +132,32 @@ class Generator(ImplicitProblem):
         # Second, G(A) = B
         # Compute the L1 loss only on the masked values
         loss_G_L1 = model.criterionL1(model.fake_B * model.mask, model.real_B * model.mask) * model.opt.lambda_L1
+        print('loss_G_L1: ', loss_G_L1)
         # Compute the L2 loss on the tumor area
-        loss_G_L2_T = model.criterionTumor(model.fake_B * model.truth,
-                    model.real_B * model.truth) * model.opt.gamma_TMSE
+        loss_G_L2_T = model.criterionTumor(model.fake_B * model.real_A,
+                    model.real_B * model.real_A) * model.opt.gamma_TMSE
+        print('loss_G_L2_T: ', loss_G_L2_T)
         # print(self.loss_G_L1, self.loss_G_L2_T)
         loss_G_L1 = zero_division(loss_G_L1, torch.sum(model.mask))
+        print('After zero division loss_G_L1: ', loss_G_L1)
         # TODO: Problem what to do with slices without tumor
-        loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(model.truth))
+        loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(model.real_A))
+        print('After zero division loss_G_L2_T: ', loss_G_L2_T)
         # print(self.loss_G_L1, self.loss_G_L2_T)
+        # Compute the radiomics loss
+        mask = model.mask.detach().cpu().int().squeeze().numpy()
+        fake_img = model.fake_B.detach().cpu().squeeze().numpy()
+        real_img = model.real_B.detach().cpu().squeeze().numpy()
+        masked_diff = (fake_img * mask) - (real_img * mask)
+        print("masked L1:", float(np.abs(masked_diff).sum()), "masked max diff:", float(masked_diff.max()))
+        rad_fake = radiomics_features(model.fake_B.detach().cpu(), model.mask.detach().cpu())
+        rad_real = radiomics_features(model.real_B.detach().cpu(), model.mask.detach().cpu())
+        loss_G_rad = rad_mse(rad_fake, rad_real) * model.opt.gamma_rad
+        print('loss_G_rad: ', loss_G_rad)
+        # loss_G_rad = model.criterionRadiomics(rad_fake, rad_real) * model.opt.gamma_rad
         # combine loss and calculate gradients
-        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T
+        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T + loss_G_rad
+        print('Combined loss_G: ', loss_G)
         return loss_G
  
  
@@ -163,16 +184,17 @@ class DenseNet(ImplicitProblem):
         images = batch['B'].to(device=device, dtype=torch.float32)
         # true_masks = batch['mask'].to(device=device, dtype=torch.long)
         mask_A = batch['A'].to(device=device, dtype=torch.float32)
-        labels = batch['label'].to(device=device, dtype=torch.long)
+        labels = batch['label'].to(device=device, dtype=torch.float32)
         if labels.dim() == 1:
             labels = labels.unsqueeze(1)
-        label_tensor = torch.tensor([labels], dtype=torch.float32)
+        label_tensor = labels
        
-        true_pred = net(images)
-        loss = criterion(true_pred, label_tensor)
+        label_pred = net(images)
+        loss = criterion(label_pred, label_tensor)
  
         # fake images and masks
         fake_mask = mask_A
+        fake_true_labels = deepcopy(labels)
         fake_image = model.netG(fake_mask)
  
         fake_pred = net(fake_image)
@@ -186,12 +208,12 @@ class Arch(ImplicitProblem):
     def training_step(self, batch):
         # mask_valid = batch['mask'].to(device=device, dtype=torch.long).squeeze(0)
         image_valid = batch['B'].type(torch.cuda.FloatTensor).to(device)
-        labels = batch['label'].to(device=device, dtype=torch.long)
+        labels = batch['label'].to(device=device, dtype=torch.float32)
         if labels.dim() == 1:
             labels = labels.unsqueeze(1)
-        label_tensor = torch.tensor([labels], dtype=torch.float32)
-        true_pred = self.densenet(image_valid)
-        loss_arch = criterion(true_pred,label_tensor)
+        label_tensor = labels
+        label_pred = self.densenet(image_valid)
+        loss_arch = criterion(label_pred, label_tensor)
         return loss_arch
  
  
@@ -228,7 +250,7 @@ netG = Generator(
     optimizer=model.optimizer_G,
     train_data_loader=train_loader,
     config=inner_config,
-    device=device,
+    # device=device,
 )
  
 netD = Discriminator(
@@ -237,7 +259,7 @@ netD = Discriminator(
     optimizer=model.optimizer_D,
     train_data_loader=train_loader,
     config=inner_config,
-    device=device,
+    # device=device,
 )
  
 densenet = DenseNet(
@@ -246,7 +268,7 @@ densenet = DenseNet(
     optimizer=optimizer_densenet,
     train_data_loader=train_loader,
     config=inner_config,
-    device=device,
+    # device=device,
 )
  
 optimizer_arch = torch.optim.Adam(arch_parameters(), lr=1e-6, betas=(0.5, 0.999), weight_decay=1e-5)
@@ -256,7 +278,7 @@ arch = Arch(
     optimizer=optimizer_arch,
     train_data_loader=val_loader,
     config=outer_config,
-    device=device,
+    # device=device,
 )
  
 problems = [netG, netD, densenet, arch]
@@ -269,3 +291,4 @@ dependencies = {"l2u": l2u, "u2l": u2l}
 engine = SSEngine(config=engine_config, problems=problems, dependencies=dependencies)
 engine.run()
 torch.save(net.state_dict(), save_path+'/densenet_final.pkl')
+ 

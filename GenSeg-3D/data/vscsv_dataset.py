@@ -42,9 +42,15 @@ class VscsvDataset(BaseDataset):
     def __init__(self, opt):
         BaseDataset.__init__(self, opt)
         df = pd.read_csv(opt.csv_file)
-        self.image_paths = df['image_nifti'].tolist()
-        self.segmentation_paths = df['mask_nifti'].tolist()
-        self.y_values = df['y_value'].tolist()
+        self.image_paths = df['image_nifti'].tolist() # filesB - mapping target image MRI
+        self.segmentation_paths = df['mask_nifti'].tolist() # filesA - mapping source mask
+        # attempt to read labels if present; otherwise default to zeros
+        if 'y_value' in df.columns:
+            self.labels = df['y_value'].tolist()
+        elif 'y_label' in df.columns:
+            self.labels = df['y_label'].tolist()
+        else:
+            self.labels = [0] * len(self.image_paths)
 
         # default behaviour: determine sliced vs 3D based on model
         if opt.model == "pix2pix3d":
@@ -63,69 +69,85 @@ class VscsvDataset(BaseDataset):
         return len(self.image_paths)
 
     def __getitem__(self, index):
-        chosen_imgA = self.image_paths[index]
-        chosen_seg = self.segmentation_paths[index]
-        y_value = int(self.y_values[index])
+        chosen_img = self.image_paths[index] # chosen_imgB
+        chosen_seg = self.segmentation_paths[index] # chosen_imgA
+        # y_value = int(self.y_values[index])
 
         truth = None
+        current_truthpath = ''
 
         if self.sliced:
             # 2D - extract a single slice from the nifti files
-            A, affine = nifti_to_np(chosen_imgA, True, self.chosen_slice)
-            seg, _ = nifti_to_np(chosen_seg, True, self.chosen_slice)
-            self.original_shape = A.shape
-            A = normalize_with_opt(A, 0)
-            B = normalize_with_opt(A, 0)  # for this task A and B are the same image
-            A = np_to_pil(A)
-            B = np_to_pil(B)
-            seg = (seg != seg.min()).astype(np.uint8)
-            seg = np_to_pil(seg)
+            img_slice, affine = nifti_to_np(chosen_img, True, self.chosen_slice)
+            mask_slice, _ = nifti_to_np(chosen_seg, True, self.chosen_slice)
+            self.original_shape = img_slice.shape
+            # normalize image intensities
+            img_slice = normalize_with_opt(img_slice, 0)
+            # ensure mask is binary
+            mask_slice = (mask_slice != mask_slice.min()).astype(np.uint8)
 
-            transform_params = get_params(self.opt, A.size)
+            # convert to PIL images for torchvision transforms
+            A_pil = np_to_pil(mask_slice)   # A: mask (input to generator)
+            B_pil = np_to_pil(img_slice)    # B: image (target)
+
+            transform_params = get_params(self.opt, A_pil.size)
             c_transform = get_transform(self.opt, transform_params, grayscale=True)
 
-            A_torch = c_transform(A)
-            B_torch = c_transform(B)
-            seg_t = c_transform(seg)
+            A_torch = c_transform(A_pil)
+            B_torch = c_transform(B_pil)
 
-            truth_torch = (seg_t != seg_t.min())
+            # truth and mask tensors (boolean)
+            truth_torch = (A_torch != A_torch.min())
             A_mask = (A_torch != A_torch.min())
+
+            # store affine for potential use downstream
+            self.affine = affine
 
             return {'A': A_torch, 'B': B_torch,
                     'mask': A_mask, 'truth': truth_torch,
-                    'A_paths': chosen_imgA, 'B_paths': chosen_seg}
+                    'A_paths': chosen_img, 'B_paths': chosen_seg,
+                    'y_value': torch.tensor(self.y_values[index], dtype=torch.long)}
         else:
             # 3D branch using TorchIO
-            A = torchio.Image(chosen_imgA, torchio.INTENSITY)
-            B = torchio.Image(chosen_imgA, torchio.INTENSITY)  # mapping target is same image
-            if os.path.exists(chosen_seg):
-                truth = torchio.LabelMap(chosen_seg)
-                truth.data[truth.data > 1] = 1
+            img = torchio.Image(chosen_img, torchio.INTENSITY) # B
+            mask = torchio.Image(chosen_seg, torchio.INTENSITY) # A
+            truth = None
+            if os.path.exists(current_truthpath):
+                truth = torchio.LabelMap(current_truthpath)
+                truth.data[truth.data > 0] = 1
 
-            self.original_shape = A.shape[1:]
-            affine = A.affine
-            transform_params = get_params_3d(self.opt, A.shape)
+            self.original_shape = mask.shape[1:]
+            affine = mask.affine
+            transform_params = get_params_3d(self.opt, mask.shape)
             c_transform = get_transform_torchio(self.opt, transform_params)
 
-            A_torch = c_transform(A)
-            B_torch = c_transform(B)
+            self.affine = affine
+            img_t = c_transform(img) # B_torch
+            mask_t = c_transform(mask) # A_torch
 
+            truth_torch = None
             if truth is not None:
-                truth = c_transform(truth)
-                truth_torch = (truth.data != truth.data.min())
+                truth_t = c_transform(mask)
+                truth_torch = (truth_t.data != truth_t.data.min())
             else:
-                truth_torch = torch.zeros(B_torch.data.shape, dtype=torch.bool)
+                truth_torch = torch.zeros(img_t.data.shape, dtype=torch.bool)
 
-            A_mask = (A_torch.data != A_torch.data.min())
-            return {'A': A_torch.data, 'B': B_torch.data,
+            # input is mask, target is image
+            A_mask = (mask_t.data != mask_t.data.min()) # if mask_t is not None else torch.zeros(img_t.data.shape, dtype=torch.bool)
+
+            # store affine for downstream use
+            # self.affine = affine
+
+            return {'A': mask_t.data,
+                    'B': img_t.data,
                     'mask': A_mask, 'truth': truth_torch,
-                    'A_paths': chosen_imgA, 'B_paths': chosen_seg,
-                    'y_value': torch.tensor(y_value, dtype=torch.long)}
+                    'A_paths': chosen_seg, 'B_paths': chosen_img,
+                    'label': torch.tensor(self.labels[index], dtype=torch.long)}
 
-"""Shim to register dataset_mode 'vscsv' with the loader.
-This exposes class VscsvDataset defined in vs_dataset_csv.py
-under module name data.vscsv_dataset, as expected by the framework.
-"""
-from .vs_dataset_csv import VscsvDataset
+# """Shim to register dataset_mode 'vscsv' with the loader.
+# This exposes class VscsvDataset defined in vs_dataset_csv.py
+# under module name data.vscsv_dataset, as expected by the framework.
+# """
+# from .vs_dataset_csv import VscsvDataset
 
 

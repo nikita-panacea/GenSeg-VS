@@ -58,6 +58,7 @@ if __name__ == '__main__':
     total_iters = 0  # the total number of training iterations
     init_time = time.time()
     
+    best_metric = float('inf')
     for epoch in range(opt.epoch_count,
                        opt.n_epochs + opt.n_epochs_decay + 1):  # outer loop for different epochs;
         # we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>
@@ -97,8 +98,17 @@ if __name__ == '__main__':
         model.update_learning_rate()  # update learning rates in the end of every epoch.
         if epoch % opt.save_epoch_freq == 0:  # cache our model every <save_epoch_freq> epochs
             print('saving the model at the end of epoch %d, iters %d' % (epoch, total_iters))
+            # always save latest
             model.save_networks('latest')
-            model.save_networks(epoch)
+            # save best if metric improved (assumes lower metric is better)
+            try:
+                current_metric = getattr(model, 'metric', None)
+                if current_metric is not None and current_metric < best_metric:
+                    best_metric = current_metric
+                    print(f"New best metric: {best_metric:.6f} — saving best checkpoint")
+                    model.save_networks('best')
+            except Exception:
+                pass
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (
             epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))

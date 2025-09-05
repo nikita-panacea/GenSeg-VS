@@ -3,7 +3,9 @@ from .base_model import BaseModel
 from . import networks
 from util.util import zero_division
 from .networks import arch_parameters
-from util.util import radiomics_features
+import SimpleITK as sitk
+from radiomics import featureextractor
+from util.util import radiomics_features, rad_mse
 
 
 class Pix2PixModel(BaseModel):
@@ -34,10 +36,10 @@ class Pix2PixModel(BaseModel):
         """
         # changing the default values to match the pix2pix paper (https://phillipi.github.io/pix2pix/)
         parser.set_defaults(norm='batch', netG='unet_256', dataset_mode='aligned')
-        parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
-        parser.add_argument('--gamma_TMSE', type=float, default=100.0, help='weight for L2 truth loss in tumor area')
+        parser.add_argument('--lambda_L1', type=float, default=1.0, help='weight for L1 loss')
+        parser.add_argument('--gamma_TMSE', type=float, default=1.0, help='weight for L2 truth loss in tumor area')
         # radiomics loss weight
-        parser.add_argument('--gamma_rad', type=float, default=100.0, help='weight for radiomics loss')
+        parser.add_argument('--gamma_rad', type=float, default=1.0, help='weight for radiomics loss')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 
@@ -68,7 +70,8 @@ class Pix2PixModel(BaseModel):
         else:  # during test time, only load G
             self.model_names = ['G']
 
-        self.nifti = True if opt.dataset_mode == "nifti" else False
+        # Treat nifti-like datasets (including our CSV wrapper) as nifti for loss reductions
+        self.nifti = True if opt.dataset_mode in ("nifti", "vscsv") else False
         # define networks (both generator and discriminator)
 
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
@@ -123,28 +126,55 @@ class Pix2PixModel(BaseModel):
         The option 'direction' can be used to swap images in domain A and domain B.
         """
         AtoB = self.opt.direction == 'AtoB'
-        self.real_A = input['A' if AtoB else 'B'].to(self.device)
-        self.real_B = input['B' if AtoB else 'A'].to(self.device)
+        # ensure inputs are float32 to match model weights (which are float32)
+        self.real_A = input['A' if AtoB else 'B']
+        self.real_B = input['B' if AtoB else 'A']
+        # cast to float and move to device
+        if isinstance(self.real_A, torch.Tensor):
+            self.real_A = self.real_A.float().to(self.device)
+        else:
+            self.real_A = torch.tensor(self.real_A, dtype=torch.float32, device=self.device)
+        if isinstance(self.real_B, torch.Tensor):
+            self.real_B = self.real_B.float().to(self.device)
+        else:
+            self.real_B = torch.tensor(self.real_B, dtype=torch.float32, device=self.device)
+
         if self.nifti:
             self.mask = input['mask']
         else:
             # If we are not using nifti the mask is just the image itself
             self.mask = torch.ones(self.real_B.shape, dtype=torch.bool)
-        self.mask = self.mask.to(self.device)
-        if self.nifti and input['truth'] is not None:
+        # ensure mask is boolean and on device
+        if isinstance(self.mask, torch.Tensor):
+            self.mask = self.mask.to(self.device).bool()
+        else:
+            self.mask = torch.tensor(self.mask, dtype=torch.bool, device=self.device)
+
+        if self.nifti and input.get('truth', None) is not None:
             self.truth = input['truth']
         else:
             # If we don't have the truth, nothing should matter
             self.truth = torch.zeros(self.real_B.shape, dtype=torch.bool)
-        self.truth = self.truth.to(self.device)
+        # ensure truth is boolean and on device
+        if isinstance(self.truth, torch.Tensor):
+            self.truth = self.truth.to(self.device).bool()
+        else:
+            self.truth = torch.tensor(self.truth, dtype=torch.bool, device=self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
         # Extract radiomics features for the (image, mask) pair before generator
         try:
             # radiomics_features expects CPU tensors (it converts to numpy internally)
-            # Use the generator input (real_A) after augmentations but before sending to G
-            self.rad_real = radiomics_features(self.real_A.cpu(), self.mask.cpu()).to(self.device)
-        except Exception:
+            # Compute radiomics on the real image (real_B) masked by the segmentation
+            # since dataset returns A=mask, B=image (mask->image mapping)
+            rad = radiomics_features(self.real_B.cpu(), self.mask.cpu())
+            self.rad_real = rad #.to(self.device)
+            # try:
+            #     print(f"[rad] rad_real extracted dtype={self.rad_real.dtype}, sample={self.rad_real}")
+            # except Exception:
+            #     print(f"[rad] rad_real extracted shape (unable to print sample)")
+        except Exception as e:
             # If radiomics extraction fails, disable radiomics loss for this batch
+            print(f"[rad] rad_real extraction failed: {e}")
             self.rad_real = None
 
     def forward(self):
@@ -153,8 +183,14 @@ class Pix2PixModel(BaseModel):
         # Extract radiomics features for the generated image paired with the (possibly augmented) mask
         try:
             # use detached CPU tensor for radiomics extraction
-            self.rad_fake = radiomics_features(self.fake_B.detach().cpu(), self.mask.cpu()).to(self.device)
-        except Exception:
+            radf = radiomics_features(self.fake_B.detach().cpu(), self.mask.cpu())
+            self.rad_fake = radf #.to(self.device)
+            # try:
+            #     print(f"[rad] rad_fake extracted dtype={self.rad_fake.dtype}, sample={self.rad_fake}")
+            # except Exception:
+            #     print(f"[rad] rad_fake extracted shape (unable to print sample)")
+        except Exception as e:
+            print(f"[rad] rad_fake extraction failed: {e}")
             self.rad_fake = None
 
     def backward_D(self):
@@ -187,18 +223,41 @@ class Pix2PixModel(BaseModel):
         # Compute the L1 loss only on the masked values
         self.loss_G_L1 = self.criterionL1(self.fake_B * self.mask, self.real_B * self.mask) * self.opt.lambda_L1
         # Compute the L2 loss on the tumor area
-        self.loss_G_L2_T = self.criterionTumor(self.fake_B * self.truth,
-                                               self.real_B * self.truth) * self.opt.gamma_TMSE
-        # print(self.loss_G_L1, self.loss_G_L2_T)
+        # Compute masked tensors as float to get stable stats
+        try:
+            masked_fake = (self.fake_B * self.truth).float()
+            masked_real = (self.real_B * self.truth).float()
+            # raw sum of squared differences over the truth region
+            raw_diffsq = torch.sum((masked_fake - masked_real) ** 2)
+            truth_sum = torch.sum(self.truth)
+            # Avoid division by zero when computing mean diffsq for logging
+            mean_diffsq = raw_diffsq / (truth_sum.float() if truth_sum.item() > 0 else 1.0)
+            print(f"[debug] gamma_TMSE={getattr(self.opt, 'gamma_TMSE', None)}, truth_sum={int(truth_sum.item())}, raw_diffsq={float(raw_diffsq):.6e}, mean_diffsq={float(mean_diffsq):.6e}")
+            try:
+                print(f"[debug] masked_real stats min={float(masked_real.min()):.6e}, max={float(masked_real.max()):.6e}, mean={float(masked_real.mean()):.6e}")
+                print(f"[debug] masked_fake stats min={float(masked_fake.min()):.6e}, max={float(masked_fake.max()):.6e}, mean={float(masked_fake.mean()):.6e}")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[debug] error computing masked stats: {e}")
+
+        self.loss_G_L2_T = self.criterionTumor(self.fake_B * self.real_A,
+                                               self.real_B * self.real_A) * self.opt.gamma_TMSE
+        print('loss_G_L2_T: ', self.loss_G_L2_T)
+        # print('self.fake_B * self.truth: ', self.fake_B * self.truth)
+        # print('self.real_B * self.truth: ', self.real_B * self.truth)
+        # normalize by number of truth voxels (preserves previous behavior)
         self.loss_G_L1 = zero_division(self.loss_G_L1, torch.sum(self.mask))
         # TODO: Problem what to do with slices without tumor
-        self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.truth))
+        self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.real_A))
         # print(self.loss_G_L1, self.loss_G_L2_T)
         # Radiomics loss: compare radiomics feature tensors of real and fake images
         if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
-            self.loss_G_rad = self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
+            self.loss_G_rad = rad_mse(self.rad_fake, self.rad_real) #* self.opt.gamma_rad #self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
+            # print('radiomics loss: ', self.loss_G_rad)
         else:
             self.loss_G_rad = torch.tensor(0.0, device=self.device)
+            # print('radiomics loss (zero tensor): ', self.loss_G_rad)
 
         # combine loss and calculate gradients
         self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T + self.loss_G_rad

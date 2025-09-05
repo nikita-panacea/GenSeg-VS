@@ -157,8 +157,9 @@ class Generator(ImplicitProblem):
         # TODO: Problem what to do with slices without tumor
         loss_G_L2_T = zero_division(loss_G_L2_T, torch.sum(model.truth))
         # print(self.loss_G_L1, self.loss_G_L2_T)
+        
         # combine loss and calculate gradients
-        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T
+        loss_G = loss_G_GAN + loss_G_L1 + loss_G_L2_T 
         return loss_G
 
 
