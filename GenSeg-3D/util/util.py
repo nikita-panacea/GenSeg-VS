@@ -25,7 +25,15 @@ def print_timestamped(string):
 
 
 def zero_division(n, d):
-    return n / d if d else n * 0
+    # Accept torch.Tensor or Python numeric. Return 0 if denominator == 0.
+    if isinstance(d, torch.Tensor):
+        # reduce to Python scalar if it's a 0-dim tensor
+        d_val = float(d.item()) if d.numel() == 1 else float(d.float().sum().item())
+    else:
+        d_val = float(d)
+    if d_val == 0.0:
+        return n * 0
+    return n / d_val
 
 
 def error(string):

@@ -26,6 +26,7 @@ from util.visualizer import Visualizer
 from util.util import print_timestamped
 import time
 import torch
+from util.util import rad_mse
 from torch.utils.data import DataLoader, random_split, Subset
 
 if __name__ == '__main__':
@@ -41,7 +42,9 @@ if __name__ == '__main__':
     # Perform the split
     subset1, subset2 = random_split(dataset, [split_1, split_2])
     dataset = DataLoader(subset1, batch_size=opt.batch_size, num_workers=int(opt.num_threads), shuffle=not opt.serial_batches)
-    
+    # validation loader from held-out subset2
+    val_loader = DataLoader(subset2, batch_size=1, num_workers=0, shuffle=False)
+
     dataset_size = len(dataset)  # get the number of images in the dataset.
     print('The number of training images = %d' % dataset_size)
     model = create_model(opt)  # create a model given opt.model and other options
@@ -59,8 +62,8 @@ if __name__ == '__main__':
     init_time = time.time()
     
     best_metric = float('inf')
-    for epoch in range(opt.epoch_count,
-                       opt.n_epochs + opt.n_epochs_decay + 1):  # outer loop for different epochs;
+    total_epochs = opt.n_epochs + opt.n_epochs_decay
+    for epoch in range(opt.epoch_count, total_epochs + 1):  # outer loop for different epochs;
         # we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>
         epoch_start_time = time.time()  # timer for entire epoch
         iter_data_time = time.time()  # timer for data loading per iteration
@@ -75,6 +78,11 @@ if __name__ == '__main__':
             total_iters += opt.batch_size
             epoch_iter += opt.batch_size
             model.set_input(data)  # unpack data from dataset and apply preprocessing
+            # expose current epoch to the model (for staged scheduling)
+            try:
+                model.current_epoch = epoch
+            except Exception:
+                pass
             model.optimize_parameters()  # calculate loss functions, get gradients, update network weights
 
             if total_iters % opt.display_freq == 0:  # display images on visdom and save images to a HTML file
@@ -109,6 +117,84 @@ if __name__ == '__main__':
                     model.save_networks('best')
             except Exception:
                 pass
+
+        # Run validation after each epoch and print metrics
+        try:
+            val_metrics = {}
+            # accumulate
+            total = 0
+            acc_global_mse = 0.0
+            acc_tumour_mse = 0.0
+            acc_tumour_dice = 0.0
+            acc_rad = 0.0
+            acc_d_real = 0.0
+            acc_d_fake = 0.0
+            n_rad = 0
+            n_tum = 0
+            with torch.no_grad():
+                for v in val_loader:
+                    model.set_input(v)
+                    model.forward()
+                    # tensors on device
+                    real_B = model.real_B
+                    fake_B = model.fake_B
+                    mask = model.mask
+                    truth = model.truth
+
+                    # global MSE on mask
+                    mask_f = mask.to(dtype=real_B.dtype)
+                    denom = torch.sum(mask_f).item() if torch.sum(mask_f).item() > 0 else float(real_B.nelement())
+                    global_mse = torch.sum(((fake_B - real_B) ** 2) * mask_f).item() / denom
+                    acc_global_mse += global_mse
+
+                    # tumour MSE (if tumour present)
+                    tcount = torch.sum(truth).item()
+                    if tcount > 0:
+                        tumour_mse = torch.sum(((fake_B - real_B) ** 2) * truth.to(dtype=real_B.dtype)).item() / tcount
+                        acc_tumour_mse += tumour_mse
+                        n_tum += 1
+                        # tumour dice: threshold fake_B within mask as simple proxy
+                        thresh = float(fake_B.mean().item())
+                        pred_t = ((fake_B * mask_f) > thresh).to(torch.uint8)
+                        true_t = truth.to(torch.uint8)
+                        inter = (pred_t & true_t).sum().item()
+                        p_sum = pred_t.sum().item()
+                        t_sum = true_t.sum().item()
+                        dice = (2.0 * inter) / (p_sum + t_sum) if (p_sum + t_sum) > 0 else 0.0
+                        acc_tumour_dice += dice
+
+                    # radiomics
+                    try:
+                        if getattr(model, 'rad_fake', None) is not None and getattr(model, 'rad_real', None) is not None:
+                            rm = rad_mse(model.rad_fake, model.rad_real)
+                            acc_rad += float(rm)
+                            n_rad += 1
+                    except Exception:
+                        pass
+
+                    # discriminator outputs
+                    try:
+                        real_ab = torch.cat((model.real_A, model.real_B), 1)
+                        fake_ab = torch.cat((model.real_A, model.fake_B), 1)
+                        pred_real = model.netD(real_ab).mean().item()
+                        pred_fake = model.netD(fake_ab).mean().item()
+                        acc_d_real += pred_real
+                        acc_d_fake += pred_fake
+                    except Exception:
+                        pass
+
+                    total += 1
+
+            if total > 0:
+                val_metrics['global_mse'] = acc_global_mse / total
+                val_metrics['tumour_mse'] = (acc_tumour_mse / n_tum) if n_tum > 0 else None
+                val_metrics['tumour_dice'] = (acc_tumour_dice / n_tum) if n_tum > 0 else None
+                val_metrics['rad_mse'] = (acc_rad / n_rad) if n_rad > 0 else None
+                val_metrics['d_real'] = acc_d_real / total
+                val_metrics['d_fake'] = acc_d_fake / total
+                print(f"Validation metrics (epoch {epoch}): {val_metrics}")
+        except Exception as e:
+            print(f"Validation failed: {e}")
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (
             epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
