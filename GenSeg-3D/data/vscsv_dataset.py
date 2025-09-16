@@ -3,6 +3,7 @@ Patient_ID, image_nifti, mask_nifti, y_value
 """
 import os
 import pandas as pd
+import nibabel as nib
 import torch
 import torchio
 import numpy as np
@@ -10,6 +11,7 @@ import numpy as np
 from data.base_dataset import BaseDataset, get_params_3d, get_params, get_transform_torchio, get_transform
 from util.util import nifti_to_np, normalize_with_opt, np_to_pil
 
+EPS = 1e-8
 
 class VscsvDataset(BaseDataset):
     @staticmethod
@@ -43,7 +45,8 @@ class VscsvDataset(BaseDataset):
         BaseDataset.__init__(self, opt)
         df = pd.read_csv(opt.csv_file)
         self.image_paths = df['image_nifti'].tolist() # filesB - mapping target image MRI
-        self.segmentation_paths = df['mask_nifti'].tolist() # filesA - mapping source mask
+        self.tumour_paths = df['mask_nifti'].tolist() # filesA - tumour segmentation mask
+        self.brain_mask_paths = df['brain_mask_nifti'].tolist() # filesA - mapping source mask
         # attempt to read labels if present; otherwise default to zeros
         if 'y_value' in df.columns:
             self.labels = df['y_value'].tolist()
@@ -70,34 +73,45 @@ class VscsvDataset(BaseDataset):
 
     def __getitem__(self, index):
         chosen_img = self.image_paths[index] # chosen_imgB
-        chosen_seg = self.segmentation_paths[index] # chosen_imgA
+        chosen_truth = self.tumour_paths[index] # truth
+        chosen_brain_mask = self.brain_mask_paths[index] # mask
         # y_value = int(self.y_values[index])
 
         truth = None
-        current_truthpath = ''
+        current_truthpath = chosen_truth
 
         if self.sliced:
             # 2D - extract a single slice from the nifti files
             img_slice, affine = nifti_to_np(chosen_img, True, self.chosen_slice)
-            mask_slice, _ = nifti_to_np(chosen_seg, True, self.chosen_slice)
+            mask_slice, affine = nifti_to_np(chosen_brain_mask, True, self.chosen_slice)
             self.original_shape = img_slice.shape
             # normalize image intensities
             img_slice = normalize_with_opt(img_slice, 0)
+            mask_slice = normalize_with_opt(mask_slice, 0)
             # ensure mask is binary
             mask_slice = (mask_slice != mask_slice.min()).astype(np.uint8)
+        
 
             # convert to PIL images for torchvision transforms
             A_pil = np_to_pil(mask_slice)   # A: mask (input to generator)
             B_pil = np_to_pil(img_slice)    # B: image (target)
+            if os.path.exists(current_truthpath):
+                truth, affine = nifti_to_np(current_truthpath, self.sliced, self.chosen_slice)
+                truth = (truth != truth.min())
+                truth = np_to_pil(truth)
 
             transform_params = get_params(self.opt, A_pil.size)
             c_transform = get_transform(self.opt, transform_params, grayscale=True)
+            
 
             A_torch = c_transform(A_pil)
             B_torch = c_transform(B_pil)
 
             # truth and mask tensors (boolean)
-            truth_torch = (A_torch != A_torch.min())
+            truth_torch = None
+            if truth is not None:
+                truth = c_transform(truth)
+                truth_torch = (truth.data != truth.data.min())
             A_mask = (A_torch != A_torch.min())
 
             # store affine for potential use downstream
@@ -105,16 +119,16 @@ class VscsvDataset(BaseDataset):
 
             return {'A': A_torch, 'B': B_torch,
                     'mask': A_mask, 'truth': truth_torch,
-                    'A_paths': chosen_img, 'B_paths': chosen_seg,
+                    'A_paths':chosen_brain_mask, 'B_paths': chosen_img,
                     'y_value': torch.tensor(self.y_values[index], dtype=torch.long)}
         else:
             # 3D branch using TorchIO
             img = torchio.Image(chosen_img, torchio.INTENSITY) # B
-            mask = torchio.Image(chosen_seg, torchio.INTENSITY) # A
+            mask = torchio.Image(chosen_brain_mask, torchio.INTENSITY) # A
             truth = None
             if os.path.exists(current_truthpath):
                 truth = torchio.LabelMap(current_truthpath)
-                truth.data[truth.data > 0] = 1
+                truth.data[truth.data > 1] = 1
 
             self.original_shape = mask.shape[1:]
             affine = mask.affine
@@ -127,7 +141,7 @@ class VscsvDataset(BaseDataset):
 
             truth_torch = None
             if truth is not None:
-                truth_t = c_transform(mask)
+                truth_t = c_transform(truth)
                 truth_torch = (truth_t.data != truth_t.data.min())
             else:
                 truth_torch = torch.zeros(img_t.data.shape, dtype=torch.bool)
@@ -141,7 +155,7 @@ class VscsvDataset(BaseDataset):
             return {'A': mask_t.data,
                     'B': img_t.data,
                     'mask': A_mask, 'truth': truth_torch,
-                    'A_paths': chosen_seg, 'B_paths': chosen_img,
+                    'A_paths': chosen_brain_mask, 'B_paths': chosen_img,
                     'label': torch.tensor(self.labels[index], dtype=torch.long)}
 
 # """Shim to register dataset_mode 'vscsv' with the loader.
