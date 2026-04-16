@@ -30,9 +30,10 @@ class Pix2Pix3DModel(Pix2PixModel):
         # changing the default values to match the pix2pix paper (https://phillipi.github.io/pix2pix/)
         # with unet_128 for 3d because otherwise it's too intense
         parser.set_defaults(norm='batch', netG='unet_128', dataset_mode='aligned')
+        # keep same baseline hyperparameters as 2D model but tuned for 3D
         parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
-        parser.add_argument('--gamma_TMSE', type=float, default=0.0, help='weight for L2 truth loss in tumor area')
-        parser.add_argument('--rad_wt', type=float, default=1.0, help='weight for radiomics features')
+        parser.add_argument('--gamma_TMSE', type=float, default=10.0, help='weight for L2 truth loss in tumor area')
+        parser.add_argument('--gamma_rad', type=float, default=1, help='weight for radiomics loss')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 

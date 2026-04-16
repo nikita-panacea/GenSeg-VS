@@ -1,5 +1,12 @@
-CUDA_VISIBLE_DEVICES=1 python train.py \
-    --dataroot /data/li/Pix2PixNIfTI/data_liver \
-    --dataset_mode nifti \
+CUDA_VISIBLE_DEVICES=0 python train.py \
+    --dataroot /home/ubuntu/Documents/Nafisha/VS_data_nifti_Genseg \
+    --dataset_mode vscsv \
+    --csv_file /home/ubuntu/Documents/Nafisha/GenSeg-VS/GenSeg_VS_with_brainmask.csv \
     --model pix2pix3d \
-    --name liver-98 \
+    --name vs_pix2pix3d_128_model \
+    --batch_size 1 \
+    --gpu_ids 0 \
+    --phase train \
+    --load_size 128 \
+    --crop_size 128 \
+    --display_winsize 128 \

@@ -6,3 +6,17 @@ soup_result
 *.pth
 */flipped_outputs.zip
 C:\Users\nikit\OneDrive - Panacea InfoSec Pvt. Ltd\Panacea_Infosec\GenSeg\GenSeg-3D\flipped_outputs.zip
+/GenSeg/checkpoints
+/GenSeg/checkpoint_e2e
+*/__pycache__/*
+GenSeg-3D/architecture_pix2pix/__pycache__/genotypes.cpython-312.pyc
+GenSeg-3D\__pycache__
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

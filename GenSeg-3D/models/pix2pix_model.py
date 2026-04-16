@@ -3,7 +3,9 @@ from .base_model import BaseModel
 from . import networks
 from util.util import zero_division
 from .networks import arch_parameters
-from util.util import radiomics_features
+import SimpleITK as sitk
+from radiomics import featureextractor
+from util.util import radiomics_features, rad_mse
 
 
 class Pix2PixModel(BaseModel):
@@ -34,10 +36,18 @@ class Pix2PixModel(BaseModel):
         """
         # changing the default values to match the pix2pix paper (https://phillipi.github.io/pix2pix/)
         parser.set_defaults(norm='batch', netG='unet_256', dataset_mode='aligned')
+        # Baseline weights (you can override via CLI)
         parser.add_argument('--lambda_L1', type=float, default=100.0, help='weight for L1 loss')
-        parser.add_argument('--gamma_TMSE', type=float, default=100.0, help='weight for L2 truth loss in tumor area')
-        # radiomics loss weight
-        parser.add_argument('--gamma_rad', type=float, default=100.0, help='weight for radiomics loss')
+        parser.add_argument('--gamma_TMSE', type=float, default=10.0, help='weight for L2 truth loss in tumor area')
+        # radiomics loss weight (start small)
+        parser.add_argument('--gamma_rad', type=float, default=1, help='weight for radiomics loss')
+        # EMA normalization smoothing (for loss normalization)
+        parser.add_argument('--ema_alpha', type=float, default=0.99, help='EMA smoothing for loss normalization')
+        parser.add_argument('--ema_eps', type=float, default=1e-6, help='small eps for EMA denominators')
+        # staged training: number of epochs per stage
+        parser.add_argument('--stage1_epochs', type=int, default=10, help='L1-only warmup epochs')
+        parser.add_argument('--stage2_epochs', type=int, default=100, help='GAN + tumor L2 epochs')
+        parser.add_argument('--stage3_epochs', type=int, default=190, help='Full training with radiomics (total epochs should match epochs arg)')
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode='vanilla')
 
@@ -68,7 +78,8 @@ class Pix2PixModel(BaseModel):
         else:  # during test time, only load G
             self.model_names = ['G']
 
-        self.nifti = True if opt.dataset_mode == "nifti" else False
+        # Treat nifti-like datasets (including our CSV wrapper) as nifti for loss reductions
+        self.nifti = True if opt.dataset_mode in ("nifti", "vscsv") else False
         # define networks (both generator and discriminator)
 
         self.netG = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
@@ -93,6 +104,12 @@ class Pix2PixModel(BaseModel):
             # Radiomics should be compared per-feature, so use mean reduction
             self.criterionRadiomics = torch.nn.MSELoss(reduction='mean')
             self.arch_param = arch_parameters()
+            # EMA trackers for loss normalization
+            self.ema_alpha = getattr(opt, 'ema_alpha', 0.99)
+            self.ema_eps = getattr(opt, 'ema_eps', 1e-6)
+            self.ema_L1 = 1.0
+            self.ema_L2 = 1.0
+            self.ema_rad = 1.0
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -123,28 +140,55 @@ class Pix2PixModel(BaseModel):
         The option 'direction' can be used to swap images in domain A and domain B.
         """
         AtoB = self.opt.direction == 'AtoB'
-        self.real_A = input['A' if AtoB else 'B'].to(self.device)
-        self.real_B = input['B' if AtoB else 'A'].to(self.device)
+        # ensure inputs are float32 to match model weights (which are float32)
+        self.real_A = input['A' if AtoB else 'B']
+        self.real_B = input['B' if AtoB else 'A']
+        # cast to float and move to device
+        if isinstance(self.real_A, torch.Tensor):
+            self.real_A = self.real_A.float().to(self.device)
+        else:
+            self.real_A = torch.tensor(self.real_A, dtype=torch.float32, device=self.device)
+        if isinstance(self.real_B, torch.Tensor):
+            self.real_B = self.real_B.float().to(self.device)
+        else:
+            self.real_B = torch.tensor(self.real_B, dtype=torch.float32, device=self.device)
+
         if self.nifti:
             self.mask = input['mask']
         else:
             # If we are not using nifti the mask is just the image itself
             self.mask = torch.ones(self.real_B.shape, dtype=torch.bool)
-        self.mask = self.mask.to(self.device)
-        if self.nifti and input['truth'] is not None:
+        # ensure mask is boolean and on device
+        if isinstance(self.mask, torch.Tensor):
+            self.mask = self.mask.to(self.device).bool()
+        else:
+            self.mask = torch.tensor(self.mask, dtype=torch.bool, device=self.device)
+
+        if self.nifti and input.get('truth', None) is not None:
             self.truth = input['truth']
         else:
             # If we don't have the truth, nothing should matter
             self.truth = torch.zeros(self.real_B.shape, dtype=torch.bool)
-        self.truth = self.truth.to(self.device)
+        # ensure truth is boolean and on device
+        if isinstance(self.truth, torch.Tensor):
+            self.truth = self.truth.to(self.device).bool()
+        else:
+            self.truth = torch.tensor(self.truth, dtype=torch.bool, device=self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
         # Extract radiomics features for the (image, mask) pair before generator
         try:
             # radiomics_features expects CPU tensors (it converts to numpy internally)
-            # Use the generator input (real_A) after augmentations but before sending to G
-            self.rad_real = radiomics_features(self.real_A.cpu(), self.mask.cpu()).to(self.device)
-        except Exception:
+            # Compute radiomics on the real image (real_B) masked by the segmentation
+            # since dataset returns A=mask, B=image (mask->image mapping)
+            rad = radiomics_features(self.real_B.cpu(), self.truth.cpu())
+            self.rad_real = rad #.to(self.device)
+            # try:
+            #     print(f"[rad] rad_real extracted dtype={self.rad_real.dtype}, sample={self.rad_real}")
+            # except Exception:
+            #     print(f"[rad] rad_real extracted shape (unable to print sample)")
+        except Exception as e:
             # If radiomics extraction fails, disable radiomics loss for this batch
+            print(f"[rad] rad_real extraction failed: {e}")
             self.rad_real = None
 
     def forward(self):
@@ -153,9 +197,33 @@ class Pix2PixModel(BaseModel):
         # Extract radiomics features for the generated image paired with the (possibly augmented) mask
         try:
             # use detached CPU tensor for radiomics extraction
-            self.rad_fake = radiomics_features(self.fake_B.detach().cpu(), self.mask.cpu()).to(self.device)
-        except Exception:
+            radf = radiomics_features(self.fake_B.cpu(), self.truth.cpu())
+            self.rad_fake = radf #.to(self.device)
+            # try:
+            #     print(f"[rad] rad_fake extracted dtype={self.rad_fake.dtype}, sample={self.rad_fake}")
+            # except Exception:
+            #     print(f"[rad] rad_fake extracted shape (unable to print sample)")
+        except Exception as e:
+            print(f"[rad] rad_fake extraction failed: {e}")
             self.rad_fake = None
+
+    def _update_ema(self, l1_val, l2_val, rad_val):
+        """Update EMA trackers for loss normalization (expects Python scalars)."""
+        alpha = self.ema_alpha
+        # only update if provided (rad can be None)
+        try:
+            self.ema_L1 = alpha * self.ema_L1 + (1 - alpha) * float(l1_val)
+        except Exception:
+            pass
+        try:
+            self.ema_L2 = alpha * self.ema_L2 + (1 - alpha) * float(l2_val)
+        except Exception:
+            pass
+        if rad_val is not None:
+            try:
+                self.ema_rad = alpha * self.ema_rad + (1 - alpha) * float(rad_val)
+            except Exception:
+                pass
 
     def backward_D(self):
         """Calculate GAN loss for the discriminator"""
@@ -189,19 +257,68 @@ class Pix2PixModel(BaseModel):
         # Compute the L2 loss on the tumor area
         self.loss_G_L2_T = self.criterionTumor(self.fake_B * self.truth,
                                                self.real_B * self.truth) * self.opt.gamma_TMSE
+        # print('self.fake_B * self.truth: ', self.fake_B * self.truth)
+        # print('self.real_B * self.truth: ', self.real_B * self.truth)
+        # Debugging: print tumor mask sums and L2 values
+        try:
+            t_sum = torch.sum(self.mask).item() if isinstance(self.mask, torch.Tensor) else float(torch.sum(self.mask))
+            # print(f"[debug] realA_sum={t_sum}, loss_G_L2_T_raw={self.loss_G_L2_T}")
+        except Exception:
+            pass
         # print(self.loss_G_L1, self.loss_G_L2_T)
         self.loss_G_L1 = zero_division(self.loss_G_L1, torch.sum(self.mask))
         # TODO: Problem what to do with slices without tumor
-        self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.truth))
+        self.loss_G_L2_T = zero_division(self.loss_G_L2_T, torch.sum(self.mask))
+        # print(f"[debug] After zero division: loss_G_L2_T={self.loss_G_L2_T}")
         # print(self.loss_G_L1, self.loss_G_L2_T)
         # Radiomics loss: compare radiomics feature tensors of real and fake images
-        if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
-            self.loss_G_rad = self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
-        else:
-            self.loss_G_rad = torch.tensor(0.0, device=self.device)
+        # if getattr(self, 'rad_real', None) is not None and getattr(self, 'rad_fake', None) is not None:
+        self.loss_G_rad = rad_mse(self.rad_fake, self.rad_real) * self.opt.gamma_rad #self.criterionRadiomics(self.rad_fake, self.rad_real) * self.opt.gamma_rad
+        print('radiomics loss: ', self.loss_G_rad)
+        # else:
+        #     # self.loss_G_rad = torch.tensor(0.0, device=self.device)
+        #     print('radiomics loss (zero tensor): ', self.loss_G_rad)
 
         # combine loss and calculate gradients
-        self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T + self.loss_G_rad
+        # self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_L2_T + self.loss_G_rad
+        # print('Combined loss_G', self.loss_G)
+        # if self.fp16:
+        #     from apex import amp
+        #     with amp.scale_loss(self.loss_G, self.optimizer_G, loss_id=1) as scaled_loss:
+        #         scaled_loss.backward()
+        # else:
+        #     self.loss_G.backward()
+        # update EMAs with raw magnitudes (use .item() when tensors)
+        try:
+            l1_val = float(self.loss_G_L1) if isinstance(self.loss_G_L1, torch.Tensor) else float(self.loss_G_L1)
+        except Exception:
+            l1_val = 0.0
+        try:
+            l2_val = float(self.loss_G_L2_T) if isinstance(self.loss_G_L2_T, torch.Tensor) else float(self.loss_G_L2_T)
+        except Exception:
+            l2_val = 0.0
+        try:
+            rad_val = float(self.loss_G_rad)
+        except Exception:
+            rad_val = None
+        self._update_ema(l1_val, l2_val, rad_val)
+
+        # Print normalized contributions for debugging
+        try:
+            print('loss EMAs:', self.ema_L1, self.ema_L2, self.ema_rad)
+        except Exception:
+            pass
+        # else:
+        #     # self.loss_G_rad = torch.tensor(0.0, device=self.device)
+        #     print('radiomics loss (zero tensor): ', self.loss_G_rad)
+
+        # Normalize each loss by its EMA so magnitudes are comparable
+        l1_norm = self.loss_G_L1 / (self.ema_L1 + self.ema_eps)
+        l2_norm = self.loss_G_L2_T / (self.ema_L2 + self.ema_eps)
+        rad_norm = (self.loss_G_rad / (self.ema_rad + self.ema_eps)) if self.ema_rad is not None else 0.0
+
+        self.loss_G = self.loss_G_GAN + l1_norm + l2_norm + rad_norm
+        print('Combined loss_G', self.loss_G)
         if self.fp16:
             from apex import amp
             with amp.scale_loss(self.loss_G, self.optimizer_G, loss_id=1) as scaled_loss:
@@ -220,6 +337,35 @@ class Pix2PixModel(BaseModel):
         self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G
         self.optimizer_G.zero_grad()  # set G's gradients to zero
         self.optimizer_arch.zero_grad()
+        # apply staged training schedule (warmup and ramping)
+        if self.isTrain:
+            # determine stage from opt (if available) or model.current_epoch
+            epoch = getattr(self, 'current_epoch', None)
+            # default behavior: run all losses if no epoch info
+            use_gan = True
+            use_rad = True
+            if epoch is not None:
+                s1 = getattr(self.opt, 'stage1_epochs', None)
+                s2 = getattr(self.opt, 'stage2_epochs', None)
+                if s1 is None or s2 is None:
+                    use_gan = True
+                    use_rad = True
+                else:
+                    if epoch <= s1:
+                        # stage 1: L1 only
+                        use_gan = False
+                        use_rad = False
+                    elif epoch <= s1 + s2:
+                        # stage 2: GAN + tumor L2 (no radiomics)
+                        use_gan = True
+                        use_rad = False
+                    else:
+                        # stage 3: full training including radiomics
+                        use_gan = True
+                        use_rad = True
+            # store current flags for backward_G to consult indirectly
+            self._use_gan = use_gan
+            self._use_rad = use_rad
         self.backward_G()  # calculate graidents for G
         self.optimizer_G.step()  # udpate G's weights
         self.optimizer_arch.step()

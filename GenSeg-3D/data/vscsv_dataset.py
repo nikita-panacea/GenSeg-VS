@@ -1,7 +1,167 @@
-"""Shim to register dataset_mode 'vscsv' with the loader.
-This exposes class VscsvDataset defined in vs_dataset_csv.py
-under module name data.vscsv_dataset, as expected by the framework.
+"""Alternate VS dataset that reads CSV with header:
+Patient_ID, image_nifti, mask_nifti, y_value
 """
-from .vs_dataset_csv import VscsvDataset
+import os
+import pandas as pd
+import nibabel as nib
+import torch
+import torchio
+import numpy as np
+
+from data.base_dataset import BaseDataset, get_params_3d, get_params, get_transform_torchio, get_transform
+from util.util import nifti_to_np, normalize_with_opt, np_to_pil
+
+EPS = 1e-8
+
+class VscsvDataset(BaseDataset):
+    @staticmethod
+    def modify_commandline_options(parser, is_train):
+        parser.add_argument('--csv_file', type=str, required=True, help='CSV with Patient_ID,image_nifti,mask_nifti,y_value')
+        parser.add_argument('--chosen_slice', type=int, default=76, help='the slice to choose (in case of 2d)')
+        parser.add_argument('--mapping_source', type=str, default="t1", const="t1", nargs='?',
+                            choices=['t1', 't2', 't1ce', 'flair'],
+                            help='the source sequencing for the mapping')
+        parser.add_argument('--mapping_target', type=str, default="t2", const="t2", nargs='?',
+                            choices=['t1', 't2', 't1ce', 'flair'],
+                            help='the source sequencing for the mapping')
+        parser.add_argument('--excel', action='store_true',
+                            help='choose to print an excel file with useful information (1) or not (0)')
+        parser.add_argument('--smoothing', type=str, default="median", const="median", nargs='?',
+                            choices=['average', 'median'],
+                            help='the kind of smoothing to apply to the image after mapping')
+        parser.add_argument('--show_plots', action='store_true',
+                            help='choose to show the final plots for the fake images while testing')
+        parser.add_argument('--truth_folder', type=str, default="truth",
+                            help='folder where the truth files are saved (if exists).')
+        parser.add_argument('--postprocess', type=int, default=-1, const=-1, nargs='?',
+                            choices=[-1, 0, 1],
+                            help='the kind of post-processing to apply to the images. -1 means no postprocessing, '
+                                 '0 means normalize in range [0, 1], '
+                                 '1 means normalize with unit variance and mean 0.')
+        parser.set_defaults(input_nc=1, output_nc=1, preprocess='take_center_and_crop', load_size=64, crop_size=64)
+        return parser
+
+    def __init__(self, opt):
+        BaseDataset.__init__(self, opt)
+        df = pd.read_csv(opt.csv_file)
+        self.image_paths = df['image_nifti'].tolist() # filesB - mapping target image MRI
+        self.tumour_paths = df['mask_nifti'].tolist() # filesA - tumour segmentation mask
+        self.brain_mask_paths = df['brain_mask_nifti'].tolist() # filesA - mapping source mask
+        # attempt to read labels if present; otherwise default to zeros
+        if 'y_value' in df.columns:
+            self.labels = df['y_value'].tolist()
+        elif 'y_label' in df.columns:
+            self.labels = df['y_label'].tolist()
+        else:
+            self.labels = [0] * len(self.image_paths)
+
+        # default behaviour: determine sliced vs 3D based on model
+        if opt.model == "pix2pix3d":
+            self.sliced = False
+        elif opt.model == "pix2pix":
+            self.sliced = True
+        else:
+            # default to 3D behavior
+            self.sliced = False
+
+        self.affine = None
+        self.original_shape = None
+        self.chosen_slice = opt.chosen_slice
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        chosen_img = self.image_paths[index] # chosen_imgB
+        chosen_truth = self.tumour_paths[index] # truth
+        chosen_brain_mask = self.brain_mask_paths[index] # mask
+        # y_value = int(self.y_values[index])
+
+        truth = None
+        current_truthpath = chosen_truth
+
+        if self.sliced:
+            # 2D - extract a single slice from the nifti files
+            img_slice, affine = nifti_to_np(chosen_img, True, self.chosen_slice)
+            mask_slice, affine = nifti_to_np(chosen_brain_mask, True, self.chosen_slice)
+            self.original_shape = img_slice.shape
+            # normalize image intensities
+            img_slice = normalize_with_opt(img_slice, 0)
+            mask_slice = normalize_with_opt(mask_slice, 0)
+            # ensure mask is binary
+            mask_slice = (mask_slice != mask_slice.min()).astype(np.uint8)
+        
+
+            # convert to PIL images for torchvision transforms
+            A_pil = np_to_pil(mask_slice)   # A: mask (input to generator)
+            B_pil = np_to_pil(img_slice)    # B: image (target)
+            if os.path.exists(current_truthpath):
+                truth, affine = nifti_to_np(current_truthpath, self.sliced, self.chosen_slice)
+                truth = (truth != truth.min())
+                truth = np_to_pil(truth)
+
+            transform_params = get_params(self.opt, A_pil.size)
+            c_transform = get_transform(self.opt, transform_params, grayscale=True)
+            
+
+            A_torch = c_transform(A_pil)
+            B_torch = c_transform(B_pil)
+
+            # truth and mask tensors (boolean)
+            truth_torch = None
+            if truth is not None:
+                truth = c_transform(truth)
+                truth_torch = (truth.data != truth.data.min())
+            A_mask = (A_torch != A_torch.min())
+
+            # store affine for potential use downstream
+            self.affine = affine
+
+            return {'A': A_torch, 'B': B_torch,
+                    'mask': A_mask, 'truth': truth_torch,
+                    'A_paths':chosen_brain_mask, 'B_paths': chosen_img,
+                    'y_value': torch.tensor(self.y_values[index], dtype=torch.long)}
+        else:
+            # 3D branch using TorchIO
+            img = torchio.Image(chosen_img, torchio.INTENSITY) # B
+            mask = torchio.Image(chosen_brain_mask, torchio.INTENSITY) # A
+            truth = None
+            if os.path.exists(current_truthpath):
+                truth = torchio.LabelMap(current_truthpath)
+                truth.data[truth.data > 1] = 1
+
+            self.original_shape = mask.shape[1:]
+            affine = mask.affine
+            transform_params = get_params_3d(self.opt, mask.shape)
+            c_transform = get_transform_torchio(self.opt, transform_params)
+
+            self.affine = affine
+            img_t = c_transform(img) # B_torch
+            mask_t = c_transform(mask) # A_torch
+
+            truth_torch = None
+            if truth is not None:
+                truth_t = c_transform(truth)
+                truth_torch = (truth_t.data != truth_t.data.min())
+            else:
+                truth_torch = torch.zeros(img_t.data.shape, dtype=torch.bool)
+
+            # input is mask, target is image
+            A_mask = (mask_t.data != mask_t.data.min()) # if mask_t is not None else torch.zeros(img_t.data.shape, dtype=torch.bool)
+
+            # store affine for downstream use
+            # self.affine = affine
+
+            return {'A': mask_t.data,
+                    'B': img_t.data,
+                    'mask': A_mask, 'truth': truth_torch,
+                    'A_paths': chosen_brain_mask, 'B_paths': chosen_img,
+                    'label': torch.tensor(self.labels[index], dtype=torch.long)}
+
+# """Shim to register dataset_mode 'vscsv' with the loader.
+# This exposes class VscsvDataset defined in vs_dataset_csv.py
+# under module name data.vscsv_dataset, as expected by the framework.
+# """
+# from .vs_dataset_csv import VscsvDataset
 
 
